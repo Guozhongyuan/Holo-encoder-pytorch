@@ -43,4 +43,4 @@ U_show = abs(U_img)
 
 save_img = np.uint8(U_show/np.max(U_show)*255)
 
-cv.imwrite('save/simulate.bmp', save_img)
+cv.imwrite('./save/simulate.bmp', save_img)
