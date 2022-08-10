@@ -4,7 +4,8 @@
 import torch
 import torch.nn as nn
 
-M = 512  # input and output image width
+N = 512
+M = 512
 
 class NormRelu(nn.Module):
     def __init__(self, num_features):
@@ -82,8 +83,8 @@ class UNet(nn.Module):
         self.down1 = ResDown(n_in=n_in, n_out=16)
         self.down2 = ResDown(n_in=16, n_out=32)
         self.down3 = ResDown(n_in=32, n_out=64)
-        self.down4 = ResDown(n_in=64, n_out=96)
-        self.up4 = ResUp(n_in=96, n_out=64)
+        self.down4 = ResDown(n_in=64, n_out=128)
+        self.up4 = ResUp(n_in=128, n_out=64)
         self.up3 = ResUp(n_in=64, n_out=32)
         self.up2 = ResUp(n_in=32, n_out=16)
         self.up1 = ResUp(n_in=16, n_out=1)
@@ -112,17 +113,65 @@ class Decoder(nn.Module):
         super().__init__()
         h = h * 1e-6
         pix = 0.008
-        lm = M * pix
+        LM = M * pix
+        LN = N * pix
+        L0 = h * z / pix
+        n = torch.linspace(0, N - 1, N)
         m = torch.linspace(0, M - 1, M)
-        x = -lm / 2 + lm / M * m
-        y = x
-        xx, yy = torch.meshgrid([x, y], indexing='xy')
-        self.spherical = torch.remainder(torch.pi / z * (xx ** 2 + yy ** 2) / h, 2 * torch.pi).cuda()
+        x0 = -L0 / 2 + L0 / M * m
+        y0 = -L0 / 2 + L0 / N * n
+        x_img, y_img = torch.meshgrid([x0, y0], indexing='xy')
+        x = -LM / 2 + LM / M * m
+        y = -LN / 2 + LN / N * n
+        x_slm, y_slm = torch.meshgrid([x, y], indexing='xy')
+        L_img = (x_img ** 2 + y_img ** 2) / z
+        L_slm = (x_slm ** 2 + y_slm ** 2) / z
+        self.theta_img = (torch.pi / h * L_img).cuda()
+        self.theta_slm = (torch.pi / h * L_slm).cuda()
+    
+    def complex_multipy(self, x_real, x_imag, y_real, y_imag):
+        real = x_real*y_real - x_imag*y_imag
+        imag = x_real*y_imag + x_imag*y_real
+        return real, imag
+
+    def diffraction(self, img, theta_rand):
+        theta_real, theta_imag = self.complex_multipy(
+            torch.cos(theta_rand),
+            torch.sin(theta_rand),
+            torch.cos(self.theta_img),
+            torch.sin(self.theta_img)
+        )
+        U_real = img * theta_real
+        U_imag = img * theta_imag
+        real_fft = torch.fft.fft2(U_real)
+        real_r = real_fft.clone().real
+        real_i = real_fft.clone().imag
+        imag_fft = torch.fft.fft2(U_imag)
+        imag_r = imag_fft.clone().real
+        imag_i = imag_fft.clone().imag
+        Uf_real = real_r - imag_i
+        Uf_imag = real_i + imag_r
+        Uf_real = torch.fft.fftshift(Uf_real)
+        Uf_imag = torch.fft.fftshift(Uf_imag)
+        Uf_real, Uf_imag = self.complex_multipy(
+            Uf_real,
+            Uf_imag,
+            torch.cos(self.theta_slm),
+            torch.sin(self.theta_slm)
+        )
+        phase = torch.atan2(Uf_imag, Uf_real)
+        return phase
+
+    def reconstruction(self, phase):
+        phase = phase - self.theta_slm
         
-    def forward(self, phase):
-        phase = phase - self.spherical
         real = torch.cos(phase)
         imag = torch.sin(phase)
+        real_pad = torch.zeros([phase.shape[0], 1, N*2, M*2], device=phase.device)
+        real_pad[:, :, (N-N//2):(N+N//2), (M-M//2):(M+M//2)] = real
+        imag_pad = torch.zeros([phase.shape[0], 1, N*2, M*2], device=phase.device)
+        imag_pad[:, :, (N-N//2):(N+N//2), (M-M//2):(M+M//2)] = imag
+
         real_fft = torch.fft.ifft2(real)
         real_r = real_fft.clone().real
         real_i = real_fft.clone().imag
@@ -131,9 +180,14 @@ class Decoder(nn.Module):
         imag_i = imag_fft.clone().imag
         ur = real_r - imag_i
         ui = real_i + imag_r
-        u = ur.square() + ui.square()
-        u = u.sqrt()
-        return u
+        u = (ur.square() + ui.square()).sqrt()
+        u_center = u[:, :, (N-N//2):(N+N//2), (M-M//2):(M+M//2)]
+        return u_center
+
+    def forward(self, image, phase):
+        phase = self.diffraction(image, phase)
+        reconstruction = self.reconstruction(phase)
+        return phase, reconstruction
 
 
 class Model(nn.Module):
@@ -141,14 +195,13 @@ class Model(nn.Module):
     def __init__(self):
         super().__init__()
         self.tanh = nn.Tanh()
-        self.norm = nn.LayerNorm([M, M], elementwise_affine=False)
         self.encoder = UNet(n_in=1)
-        self.decoder = Decoder(h=532, z=800)
+        self.decoder = Decoder(h=532, z=800)  # TODO Z
         
     def forward(self, image):
-        image_norm = self.norm(image)
-        phase = torch.pi * self.tanh(self.encoder(image_norm))
-        reconstruction = self.decoder(phase)
+        image = image / 255.0
+        random_phase = torch.pi * self.tanh(self.encoder(image))
+        phase, reconstruction = self.decoder(image, random_phase)
         return phase, reconstruction
     
     
@@ -158,7 +211,7 @@ if __name__ == '__main__':
     net = Model().cuda()
     net.eval()
     
-    input = torch.randn([1, 1, M, M]).cuda()
-    phase, image_norm, image_fft = net(input)
+    input = torch.randn([1, 1, N, M]).cuda()
+    phase, reconstruction = net(input)
     print(phase.shape)
-    print(image_fft.shape)
+    print(reconstruction.shape)
