@@ -172,10 +172,10 @@ class Decoder(nn.Module):
         imag_pad = torch.zeros([phase.shape[0], 1, N*2, M*2], device=phase.device)
         imag_pad[:, :, (N-N//2):(N+N//2), (M-M//2):(M+M//2)] = imag
 
-        real_fft = torch.fft.ifft2(real)
+        real_fft = torch.fft.ifft2(real_pad)
         real_r = real_fft.clone().real
         real_i = real_fft.clone().imag
-        imag_fft = torch.fft.ifft2(imag)
+        imag_fft = torch.fft.ifft2(imag_pad)
         imag_r = imag_fft.clone().real
         imag_i = imag_fft.clone().imag
         ur = real_r - imag_i
